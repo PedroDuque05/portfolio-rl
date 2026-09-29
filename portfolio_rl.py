@@ -1,52 +1,53 @@
 # =====================================================================================
-# PIPELINE DE RL PARA ALOCACAO DE CARTEIRA — versao a prova de auto-ilusao
+# RL PIPELINE FOR PORTFOLIO ALLOCATION - built to avoid fooling myself
 # =====================================================================================
-# FILOSOFIA (o porque de cada escolha):
+# PHILOSOPHY (why I made each choice):
 #
-#  1. AGENTE DELIBERADAMENTE MODESTO. Em dominio de baixo sinal/ruido alto, um agente
-#     mais expressivo nao extrai mais sinal — decora melhor o percurso historico.
-#     Simplicidade (PPO + MLP pequena + poucas features + poucos timesteps) E a
-#     regularizacao que mais importa. A potencia esta na VALIDACAO, nao no modelo.
+#  1. DELIBERATELY MODEST AGENT. In a domain with low signal and high noise, a more
+#     expressive agent does not extract more signal, it just memorises the historical
+#     path better. Simplicity (PPO + small MLP + few features + few timesteps) is the
+#     regularisation that matters most. The strength is in the VALIDATION, not the model.
 #
-#  2. REWARD = GESTAO DE RISCO, nao previsao de direcao. Ja provamos (modelo de
-#     direcao preso em ln(2)) que a direcao e imprevisivel. A reward usa o
-#     Differential Sharpe Ratio (Moody & Saffell, 1998) — versao online e estavel
-#     do Sharpe — mais uma penalizacao de drawdown. Pede ao agente que MODULE
-#     EXPOSICAO ao risco (o unico sinal real: clustering de volatilidade), nao que
-#     adivinhe retornos.
+#  2. REWARD = RISK MANAGEMENT, not direction forecasting. My LSTM project already
+#     showed (training loss stuck at ln(2)) that direction is unpredictable. The reward
+#     uses the Differential Sharpe Ratio (Moody & Saffell, 1998), an online and stable
+#     version of the Sharpe ratio, plus a drawdown penalty. It asks the agent to
+#     MODULATE ITS RISK EXPOSURE (the only real signal: volatility clustering) instead
+#     of guessing returns.
 #
-#  3. VALIDACAO DE TRES NIVEIS:
-#       - treino: o agente aprende pesos dentro de cada janela.
-#       - walk-forward: comparamos configuracoes / medimos generalizacao.
-#       - HELD-OUT SAGRADO: um bloco final que NAO existe durante o desenvolvimento;
-#         corre-se UMA vez no fim. E a unica estimativa honesta.
+#  3. THREE-LEVEL VALIDATION:
+#       - training: the agent learns its weights inside each window.
+#       - walk-forward: I compare configurations / measure generalisation.
+#       - SACRED HELD-OUT: a final block that does NOT exist during development;
+#         it is run ONCE at the end. It is the only honest estimate.
 #
-#  4. PURGING + EMBARGO entre treino e teste (Lopez de Prado): gap temporal que mata
-#     a autocorrelacao das janelas de lookback sobrepostas.
+#  4. PURGING + EMBARGO between train and test (Lopez de Prado): a time gap that removes
+#     the autocorrelation coming from overlapping lookback windows.
 #
-#  5. MULTIPLAS SEEDS + DEFLATED SHARPE RATIO: o RL e estocastico; um numero unico
-#     mente. O DSR desconta o Sharpe pelo n de tentativas — mede quantas vezes o
-#     nosso proprio cerebro tocou nos dados (o multiple-testing e o assassino real).
+#  5. MULTIPLE SEEDS + DEFLATED SHARPE RATIO: RL is stochastic, so a single number lies.
+#     The DSR discounts the Sharpe by the number of trials, i.e. how many times I touched
+#     the data myself (multiple testing is the real killer).
 #
-#  6. TESTES DE ROBUSTEZ:
-#       - DADOS SINTETICOS (juiz supremo): series com as mesmas propriedades
-#         marginais mas SEM estrutura temporal. Se o agente "ganha" aqui, o pipeline
-#         fabrica sinal a partir de ruido e o resultado real e falso.
-#       - ANALISE POR REGIME: o edge deve aparecer onde a teoria diz (alta vol),
-#         nao espalhado ao acaso. O ONDE ganha e, ele proprio, evidencia.
+#  6. ROBUSTNESS TESTS:
+#       - SYNTHETIC DATA (the ultimate judge): series with the same marginal properties
+#         but NO time structure. If the agent "wins" here, the pipeline creates signal
+#         out of noise and the real result is false.
+#       - REGIME ANALYSIS: the edge should appear where theory says it should (high vol),
+#         not scattered randomly. WHERE it wins is itself evidence.
 #
-# NOTA DE HONESTIDADE: os ETFs abaixo foram escolhidos ex-post (survivorship/selection
-# bias). Nao ha aqui base de dados de ETFs delistados; o vies fica NOMEADO mas nao
-# totalmente eliminado. Num cenario de producao, o universo seria definido com a
-# informacao disponivel no inicio.
+# HONESTY NOTE: the ETFs below were chosen ex-post (survivorship/selection bias). There
+# is no database of delisted ETFs here, so the bias is NAMED but not fully removed. In a
+# production setting, the universe would be defined with the information available at
+# the start.
 #
-# COMO CORRER: pip install -r requirements.txt && python portfolio_rl.py
-# Parametros modestos DE PROPOSITO (ver filosofia). Demora ~5-12 min em CPU.
+# HOW TO RUN: in Google Colab, run all cells
+#             (or locally: pip install -r requirements.txt && python portfolio_rl.py)
+# Parameters are modest ON PURPOSE (see philosophy). Takes ~5-12 min on CPU.
 # =====================================================================================
 
 
 # =====================================================================================
-# SECCAO 1 — IMPORTS E CONFIGURACAO
+# SECTION 1 - IMPORTS AND CONFIGURATION
 # =====================================================================================
 import numpy as np
 import pandas as pd
@@ -63,40 +64,41 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 import warnings, os, random
 warnings.filterwarnings("ignore")
 
-# ---- Universo e periodo ----
+# ---- Universe and period ----
 ETFS   = ["SPY", "QQQ", "IWM", "EFA", "EEM", "AGG"]
 START  = "2010-01-01"
 END    = None
 
-# ---- Mecanica de mercado ----
-TRANSACTION_COST = 0.001     # 10 bps por unidade de turnover
-LOOKBACK         = 20        # dias para features de estado (retorno medio, vol)
+# ---- Market mechanics ----
+TRANSACTION_COST = 0.001     # 10 bps per unit of turnover
+LOOKBACK         = 20        # days used for the state features (average return, vol)
 
-# ---- Reward (gestao de risco) ----
-ETA_DSR     = 0.02           # taxa de adaptacao do Differential Sharpe
-DD_PENALTY  = 0.10           # peso da penalizacao de drawdown
-REWARD_SCALE = 100.0         # escala o DSR para dar sinal decente ao PPO
+# ---- Reward (risk management) ----
+ETA_DSR      = 0.02          # adaptation rate of the Differential Sharpe
+DD_PENALTY   = 0.10          # weight of the drawdown penalty
+REWARD_SCALE = 100.0         # scales the DSR so PPO gets a decent signal
 
-# ---- Agente DELIBERADAMENTE MODESTO ----
-TRAIN_TIMESTEPS = 20000      # modesto de proposito (menos memorizacao)
-N_SEEDS         = 3          # n de seeds por configuracao
-POLICY_KWARGS   = dict(net_arch=[64, 64])   # MLP pequena
+# ---- Deliberately MODEST agent ----
+TRAIN_TIMESTEPS = 20000      # modest on purpose (less memorisation)
+N_SEEDS         = 3          # number of seeds per configuration
+POLICY_KWARGS   = dict(net_arch=[64, 64])   # small MLP
 
-# ---- Validacao ----
-EMBARGO_DAYS    = 5          # gap treino->teste (purging/embargo)
-HELDOUT_DAYS    = 378        # ~18 meses finais SAGRADOS (nunca tocar ate ao fim)
-WF_TRAIN_DAYS   = 756        # ~3 anos de treino por janela walk-forward
-WF_TEST_DAYS    = 189        # ~9 meses de teste por janela
-WF_STEP_DAYS    = 189        # avanco entre janelas
+# ---- Validation ----
+EMBARGO_DAYS    = 5          # gap between train and test (purging/embargo)
+HELDOUT_DAYS    = 378        # last ~18 months, SACRED (not touched until the very end)
+WF_TRAIN_DAYS   = 756        # ~3 years of training per walk-forward window
+WF_TEST_DAYS    = 189        # ~9 months of testing per window
+WF_STEP_DAYS    = 189        # step between windows
 
-REBAL_FREQ      = 21         # rebalanceamento mensal dos baselines dinamicos
-RF_ANNUAL       = 0.0        # taxa sem risco (simplificacao)
+REBAL_FREQ      = 21         # monthly rebalancing for the dynamic baselines
+RF_ANNUAL       = 0.0        # risk-free rate (simplification)
+PERIODS         = 252        # trading days per year
 
-print("Configuracao carregada. Agente modesto de proposito (ver filosofia).")
+print("Configuration loaded. Agent is modest on purpose (see philosophy).")
 
 
 # =====================================================================================
-# SECCAO 2 — DADOS: download + split DEV / HELD-OUT SAGRADO
+# SECTION 2 - DATA: download + split into DEV / SACRED HELD-OUT
 # =====================================================================================
 def download_prices(tickers, start, end):
     raw = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)
@@ -107,33 +109,33 @@ def download_prices(tickers, start, end):
     return px
 
 prices = download_prices(ETFS, START, END)
-print(f"Precos: {prices.shape[0]} dias, {prices.shape[1]} ETFs "
+print(f"Prices: {prices.shape[0]} days, {prices.shape[1]} ETFs "
       f"({prices.index.min().date()} -> {prices.index.max().date()})")
 
-# SPLIT SAGRADO: o held-out final nao existe durante o desenvolvimento.
+# SACRED SPLIT: the final held-out set does not exist during development.
 dev_prices     = prices.iloc[:-HELDOUT_DAYS]
-heldout_prices = prices.iloc[-(HELDOUT_DAYS + LOOKBACK + 1):]   # +lookback p/ formar estado
-print(f"DEV: {dev_prices.shape[0]} dias | HELD-OUT (sagrado): {HELDOUT_DAYS} dias")
+heldout_prices = prices.iloc[-(HELDOUT_DAYS + LOOKBACK + 1):]   # +lookback to build the state
+print(f"DEV: {dev_prices.shape[0]} days | HELD-OUT (sacred): {HELDOUT_DAYS} days")
 
 
 # =====================================================================================
-# SECCAO 3 — FEATURES ESTACIONARIAS (sem niveis de preco, sem leakage)
+# SECTION 3 - STATIONARY FEATURES (no price levels, no leakage)
 # =====================================================================================
 def to_returns(prices):
-    """Log-retornos diarios (estacionarios)."""
+    """Daily log returns (stationary)."""
     return np.log(prices / prices.shift(1)).dropna()
 
 
 # =====================================================================================
-# SECCAO 4 — AMBIENTE: reward de Differential Sharpe + drawdown, acao via softmax
+# SECTION 4 - ENVIRONMENT: Differential Sharpe + drawdown reward, action via softmax
 # =====================================================================================
 class PortfolioEnv(gym.Env):
     """
-    Estado:  [retorno medio recente (n), volatilidade recente (n), pesos atuais (n)]
-    Acao:    logits -> softmax -> pesos long-only que somam 1 (sem hacks de normalizacao)
-    Reward:  Differential Sharpe Ratio (online, estavel) + penalizacao de drawdown,
-             liquido de custos de transacao. NAO recompensa direcao; recompensa
-             retorno AJUSTADO AO RISCO e controlo de exposicao.
+    State:   [recent average return (n), recent volatility (n), current weights (n)]
+    Action:  logits -> softmax -> long-only weights that sum to 1 (no normalisation hacks)
+    Reward:  Differential Sharpe Ratio (online, stable) + drawdown penalty,
+             net of transaction costs. It does NOT reward direction; it rewards
+             RISK-ADJUSTED return and exposure control.
     """
     metadata = {"render_modes": []}
 
@@ -149,7 +151,7 @@ class PortfolioEnv(gym.Env):
         self.reward_scale = reward_scale
 
         self.action_space = spaces.Box(low=-5.0, high=5.0, shape=(self.n,), dtype=np.float32)
-        # 3n features; ranges largos pois escalamos manualmente (sem stats globais => sem leakage)
+        # 3n features; wide ranges because I scale manually (no global stats => no leakage)
         self.observation_space = spaces.Box(low=-10.0, high=10.0,
                                             shape=(self.n * 3,), dtype=np.float32)
         self.reset()
@@ -158,30 +160,30 @@ class PortfolioEnv(gym.Env):
         super().reset(seed=seed)
         self.t = self.lookback
         self.weights = np.ones(self.n) / self.n
-        # estado do Differential Sharpe
+        # Differential Sharpe state
         self.A = 0.0
         self.B = 0.0
-        # estado de drawdown
+        # drawdown state
         self.nav = 1.0
         self.peak = 1.0
         return self._obs(), {}
 
     def _obs(self):
         window = self.returns[self.t - self.lookback:self.t]
-        mean_r = window.mean(axis=0) * 100.0     # escala fixa (sem leakage)
+        mean_r = window.mean(axis=0) * 100.0     # fixed scale (no leakage)
         vol_r  = window.std(axis=0)  * 100.0
         obs = np.concatenate([mean_r, vol_r, self.weights]).astype(np.float32)
         return np.clip(obs, -10.0, 10.0)
 
     def step(self, action):
-        w = softmax(np.asarray(action, dtype=np.float64))   # long-only, soma 1
+        w = softmax(np.asarray(action, dtype=np.float64))   # long-only, sums to 1
 
-        # retorno do portfolio no passo seguinte, liquido de custos
+        # portfolio return on the next step, net of costs
         port_ret = float(np.dot(w, self.returns[self.t]))
         turnover = float(np.sum(np.abs(w - self.weights)))
         net_ret  = port_ret - turnover * self.tc
 
-        # atualizar NAV e drawdown
+        # update NAV and drawdown
         self.nav *= (1.0 + net_ret)
         self.peak = max(self.peak, self.nav)
         drawdown = (self.nav - self.peak) / self.peak     # <= 0
@@ -197,7 +199,7 @@ class PortfolioEnv(gym.Env):
         self.A += self.eta * dA
         self.B += self.eta * dB
 
-        reward = self.reward_scale * dsr + self.dd_penalty * drawdown  # dd<0 penaliza
+        reward = self.reward_scale * dsr + self.dd_penalty * drawdown  # drawdown < 0 penalises
 
         self.weights = w
         self.t += 1
@@ -207,7 +209,7 @@ class PortfolioEnv(gym.Env):
 
 
 def rollout_weights(model, returns, lookback=LOOKBACK):
-    """Corre a politica treinada sobre `returns`, devolve serie de retornos liquidos e pesos."""
+    """Runs the trained policy over `returns`, returns the net return series and the weights."""
     env = PortfolioEnv(returns, TRANSACTION_COST, lookback, ETA_DSR, DD_PENALTY, REWARD_SCALE)
     obs, _ = env.reset()
     done = False
@@ -220,17 +222,17 @@ def rollout_weights(model, returns, lookback=LOOKBACK):
 
 
 # =====================================================================================
-# SECCAO 5 — BASELINES (a vara de medir; sem leakage)
+# SECTION 5 - BASELINES (the yardstick; no leakage)
 # =====================================================================================
 def nav_from_returns(rets):
     return np.cumprod(1.0 + np.asarray(rets))
 
 def bh_equal_weight(returns):
-    """Buy & hold 1/N (sem rebalanceamento)."""
+    """Buy & hold 1/N (no rebalancing)."""
     R = returns.values
     n = R.shape[1]
     w0 = np.ones(n) / n
-    # drift dos pesos com os precos: NAV por ativo
+    # weights drift with prices: NAV per asset
     growth = np.cumprod(1.0 + R, axis=0)
     port = (w0 * growth).sum(axis=1)
     rets = np.diff(port) / port[:-1]
@@ -246,7 +248,7 @@ def bh_6040(returns):
     return np.concatenate([[0.0], rets])
 
 def risk_parity(returns, lookback=60, rebal=REBAL_FREQ):
-    """Inverse-vol weighting, rebalanceado periodicamente (vol estimada so com passado)."""
+    """Inverse-vol weighting, rebalanced periodically (vol estimated using only the past)."""
     R = returns.values; T, n = R.shape
     out = np.zeros(T); w = np.ones(n)/n
     for t in range(T):
@@ -258,7 +260,7 @@ def risk_parity(returns, lookback=60, rebal=REBAL_FREQ):
     return out
 
 def mean_variance(returns_train, returns_eval, ridge=1e-3):
-    """Markowitz: pesos estimados SO no treino, aplicados no eval (sem leakage)."""
+    """Markowitz: weights estimated ONLY on the training set, applied on eval (no leakage)."""
     Rtr = returns_train.values
     mu = Rtr.mean(axis=0)
     cov = np.cov(Rtr.T) + ridge * np.eye(Rtr.shape[1])
@@ -275,9 +277,9 @@ def random_alloc(returns, seed=0):
 
 
 # =====================================================================================
-# SECCAO 6 — METRICAS HONESTAS
+# SECTION 6 - HONEST METRICS
 # =====================================================================================
-def metrics(rets, rf_annual=RF_ANNUAL, periods=252):
+def metrics(rets, rf_annual=RF_ANNUAL, periods=PERIODS):
     r = np.asarray(rets, dtype=float)
     r = r[np.isfinite(r)]
     if len(r) < 2:
@@ -289,7 +291,7 @@ def metrics(rets, rf_annual=RF_ANNUAL, periods=252):
     vol = r.std() * np.sqrt(periods)
     rf_daily = rf_annual / periods
     excess = r - rf_daily
-    sharpe = excess.mean() / (r.std() + 1e-12) * np.sqrt(periods)
+    sharpe = excess.mean() / (r.std() + 1e-12) * np.sqrt(periods)   # ANNUALISED Sharpe
     downside = r[r < 0].std() if (r < 0).any() else 1e-12
     sortino = excess.mean() / (downside + 1e-12) * np.sqrt(periods)
     peak = np.maximum.accumulate(nav)
@@ -300,31 +302,48 @@ def metrics(rets, rf_annual=RF_ANNUAL, periods=252):
 
 
 # =====================================================================================
-# SECCAO 7 — DEFLATED / PROBABILISTIC SHARPE RATIO (Bailey & Lopez de Prado)
+# SECTION 7 - DEFLATED / PROBABILISTIC SHARPE RATIO (Bailey & Lopez de Prado)
 # =====================================================================================
-def probabilistic_sharpe(sharpe_hat, n_obs, sr_benchmark, skew, kurt):
-    """PSR: P(SR verdadeiro > sr_benchmark) dado o SR observado e os momentos."""
-    num = (sharpe_hat - sr_benchmark) * np.sqrt(n_obs - 1)
-    den = np.sqrt(1 - skew*sharpe_hat + (kurt - 1)/4.0 * sharpe_hat**2)
+# NOTE: the PSR formula needs the Sharpe PER PERIOD (here: daily), because it is
+# combined with the number of daily observations. The rest of the code reports
+# ANNUALISED Sharpes, so I convert them to daily inside these two functions.
+# (Before this fix I passed the annualised Sharpe straight into the formula, which
+# overstated the DSR.)
+def probabilistic_sharpe(sr_hat, n_obs, sr_benchmark, skew, kurt):
+    """
+    PSR: P(true SR > sr_benchmark) given the observed SR and the return moments.
+    ALL Sharpe inputs must be per-period (daily), not annualised.
+    `kurt` is the regular (Pearson) kurtosis, where a normal distribution = 3.
+    """
+    num = (sr_hat - sr_benchmark) * np.sqrt(n_obs - 1)
+    den = np.sqrt(1 - skew*sr_hat + (kurt - 1)/4.0 * sr_hat**2)
     return float(stats.norm.cdf(num / (den + 1e-12)))
 
-def deflated_sharpe(sharpe_hat, n_obs, sharpe_trials, skew, kurt):
+def deflated_sharpe(sharpe_hat_annual, n_obs, sharpe_trials_annual, skew, kurt,
+                    periods=PERIODS):
     """
-    DSR: corrige o melhor Sharpe observado pelo n de tentativas (multiple testing).
-    sharpe_trials = lista dos Sharpes (ANUALIZADOS) de todas as configs/seeds testadas.
+    DSR: corrects the best observed Sharpe for the number of trials (multiple testing).
+    Inputs are ANNUALISED Sharpes (as printed by `metrics`); they are converted to daily
+    Sharpes here before being used in the formula.
+    Returns: (dsr, sr0_annual), where sr0_annual is the Sharpe expected by luck only.
     """
-    N = max(len(sharpe_trials), 2)
-    var_sr = np.var(sharpe_trials, ddof=1) + 1e-12
+    to_daily = 1.0 / np.sqrt(periods)
+    sr_hat_d = sharpe_hat_annual * to_daily
+    trials_d = np.asarray(sharpe_trials_annual, dtype=float) * to_daily
+
+    N = max(len(trials_d), 2)
+    var_sr = np.var(trials_d, ddof=1) + 1e-12
     gamma = 0.5772156649  # Euler-Mascheroni
     z1 = stats.norm.ppf(1 - 1.0/N)
     z2 = stats.norm.ppf(1 - 1.0/(N*np.e))
-    sr0 = np.sqrt(var_sr) * ((1 - gamma)*z1 + gamma*z2)   # Sharpe esperado SO por sorte
-    dsr = probabilistic_sharpe(sharpe_hat, n_obs, sr0, skew, kurt)
-    return dsr, sr0
+    sr0_d = np.sqrt(var_sr) * ((1 - gamma)*z1 + gamma*z2)   # daily Sharpe expected by luck ONLY
+
+    dsr = probabilistic_sharpe(sr_hat_d, n_obs, sr0_d, skew, kurt)
+    return dsr, sr0_d * np.sqrt(periods)                     # sr0 back in annual units for printing
 
 
 # =====================================================================================
-# SECCAO 8 — TREINAR + AVALIAR UMA JANELA
+# SECTION 8 - TRAIN + EVALUATE ONE WINDOW
 # =====================================================================================
 def train_agent(returns_train, seed, timesteps=TRAIN_TIMESTEPS):
     np.random.seed(seed); random.seed(seed)
@@ -339,18 +358,18 @@ def train_agent(returns_train, seed, timesteps=TRAIN_TIMESTEPS):
 
 
 # =====================================================================================
-# SECCAO 9 — WALK-FORWARD + MULTI-SEED (o motor de validacao)
+# SECTION 9 - WALK-FORWARD + MULTI-SEED (the validation engine)
 # =====================================================================================
 def walk_forward(dev_returns, label="DEV"):
     """
-    Janelas deslizantes com EMBARGO entre treino e teste. Para cada janela, treina
-    N_SEEDS agentes e agrega. Devolve: serie de retornos OOS do agente (concatenada),
-    e dict com baselines avaliados nos MESMOS segmentos.
+    Rolling windows with an EMBARGO between train and test. For each window, it trains
+    N_SEEDS agents and aggregates them. Returns: the agent's out-of-sample return series
+    (concatenated), and a dict with the baselines evaluated on the SAME segments.
     """
     T = len(dev_returns)
     agent_oos = []
     base_oos = {k: [] for k in ["equal", "6040", "rparity", "meanvar", "random"]}
-    seed_sharpes = []   # para o DSR
+    seed_sharpes = []   # annualised Sharpes, for the DSR
 
     start = 0
     win = 0
@@ -362,7 +381,7 @@ def walk_forward(dev_returns, label="DEV"):
         r_train = dev_returns.iloc[tr0:tr1]
         r_test  = dev_returns.iloc[te0:te1]
 
-        # treinar N_SEEDS e fazer media dos retornos OOS (mais honesto que best-seed)
+        # train N_SEEDS agents and average their OOS returns (more honest than best-seed)
         seed_rets = []
         for s in range(N_SEEDS):
             model = train_agent(r_train, seed=1000*win + s)
@@ -374,14 +393,14 @@ def walk_forward(dev_returns, label="DEV"):
         agent_win = np.mean([x[:L] for x in seed_rets], axis=0)
         agent_oos.append(agent_win)
 
-        # baselines no MESMO segmento de teste (alinhar comprimento L)
+        # baselines on the SAME test segment (align length to L)
         base_oos["equal"].append(bh_equal_weight(r_test)[-L:])
         base_oos["6040"].append(bh_6040(r_test)[-L:])
         base_oos["rparity"].append(risk_parity(r_test)[-L:])
         base_oos["meanvar"].append(mean_variance(r_train, r_test)[-L:])
         base_oos["random"].append(random_alloc(r_test, seed=win)[-L:])
 
-        print(f"  [{label}] janela {win}: treino {tr0}-{tr1}, teste {te0}-{te1} "
+        print(f"  [{label}] window {win}: train {tr0}-{tr1}, test {te0}-{te1} "
               f"(embargo {EMBARGO_DAYS}d), L={L}")
         start += WF_STEP_DAYS
 
@@ -392,14 +411,14 @@ def walk_forward(dev_returns, label="DEV"):
 
 
 # =====================================================================================
-# SECCAO 10 — TESTES DE ROBUSTEZ
+# SECTION 10 - ROBUSTNESS TESTS
 # =====================================================================================
 def synthetic_returns(returns, seed=0):
     """
-    Juiz supremo: reamostra DIAS INTEIROS com reposicao. Mantem a distribuicao marginal
-    e as correlacoes entre ativos, mas DESTROI a estrutura temporal (autocorrelacao,
-    clustering de volatilidade). Por construcao NAO ha nada para o agente aprender.
-    Se o agente "ganhar" aqui, o pipeline fabrica sinal a partir de ruido.
+    The ultimate judge: resamples WHOLE DAYS with replacement. It keeps the marginal
+    distribution and the correlations between assets, but DESTROYS the time structure
+    (autocorrelation, volatility clustering). By construction there is NOTHING for the
+    agent to learn. If the agent "wins" here, the pipeline is creating signal out of noise.
     """
     rng = np.random.default_rng(seed)
     R = returns.values
@@ -408,67 +427,67 @@ def synthetic_returns(returns, seed=0):
     return pd.DataFrame(synth, columns=returns.columns)
 
 def regime_split(returns, lookback=20, q=0.66):
-    """Classifica cada dia em ALTA vol vs BAIXA vol (vol de mercado realizada)."""
+    """Classifies each day as HIGH vs LOW volatility (realised market vol)."""
     mkt = returns.mean(axis=1)
     vol = mkt.rolling(lookback).std()
     thr = vol.quantile(q)
-    return (vol > thr).values   # True = alta volatilidade
+    return (vol > thr).values   # True = high volatility
 
 
 # =====================================================================================
-# SECCAO 11 — ORQUESTRACAO
+# SECTION 11 - MAIN
 # =====================================================================================
 def main():
     dev_returns = to_returns(dev_prices)
 
-    print("\n=== WALK-FORWARD (validacao) ===")
+    print("\n=== WALK-FORWARD (validation) ===")
     agent_oos, base_oos, seed_sharpes = walk_forward(dev_returns, "DEV")
 
-    print("\n=== METRICAS OOS (walk-forward agregado) ===")
+    print("\n=== OOS METRICS (aggregated walk-forward) ===")
     rows = {"RL Agent": metrics(agent_oos),
             "Equal-Weight": metrics(base_oos["equal"]),
             "60/40": metrics(base_oos["6040"]),
             "Risk Parity": metrics(base_oos["rparity"]),
             "Mean-Variance": metrics(base_oos["meanvar"]),
             "Random": metrics(base_oos["random"])}
-    hdr = f"{'Estrategia':<16}{'Ret%':>8}{'Anual%':>8}{'Vol%':>7}{'Sharpe':>8}{'Sortino':>9}{'Calmar':>8}{'MaxDD%':>8}"
+    hdr = f"{'Strategy':<16}{'Ret%':>8}{'Annual%':>9}{'Vol%':>7}{'Sharpe':>8}{'Sortino':>9}{'Calmar':>8}{'MaxDD%':>8}"
     print(hdr); print("-"*len(hdr))
     for name, m in rows.items():
-        print(f"{name:<16}{m['total']:>8.1f}{m['annual']:>8.1f}{m['vol']:>7.1f}"
+        print(f"{name:<16}{m['total']:>8.1f}{m['annual']:>9.1f}{m['vol']:>7.1f}"
               f"{m['sharpe']:>8.2f}{m['sortino']:>9.2f}{(m['calmar'] if np.isfinite(m['calmar']) else 0):>8.2f}{m['mdd']:>8.1f}")
 
-    # ---- Deflated Sharpe Ratio: o agente bate o ACASO dado o n de tentativas? ----
+    # ---- Deflated Sharpe Ratio: does the agent beat luck, given the number of trials? ----
     a = agent_oos[np.isfinite(agent_oos)]
     sk = stats.skew(a); ku = stats.kurtosis(a, fisher=False)
     sr_annual = metrics(agent_oos)["sharpe"]
     dsr, sr0 = deflated_sharpe(sr_annual, len(a), seed_sharpes, sk, ku)
-    print(f"\nDeflated Sharpe Ratio: tentativas={len(seed_sharpes)}, "
-          f"Sharpe-so-por-sorte~{sr0:.2f}, Sharpe-agente={sr_annual:.2f}")
-    print(f"  DSR (prob. de o edge ser real) = {dsr:.3f}  "
-          f"{'-> credivel' if dsr > 0.95 else '-> NAO significativo (dentro do ruido)'}")
+    print(f"\nDeflated Sharpe Ratio: trials={len(seed_sharpes)}, "
+          f"Sharpe-by-luck-only~{sr0:.2f} (annualised), agent Sharpe={sr_annual:.2f} (annualised)")
+    print(f"  DSR (probability that the edge is real) = {dsr:.3f}  "
+          f"{'-> credible' if dsr > 0.95 else '-> NOT significant (within noise)'}")
 
-    # ---- Teste do juiz supremo: dados sinteticos ----
-    print("\n=== ROBUSTEZ: DADOS SINTETICOS (sem estrutura temporal) ===")
+    # ---- Ultimate judge test: synthetic data ----
+    print("\n=== ROBUSTNESS: SYNTHETIC DATA (no time structure) ===")
     synth = synthetic_returns(dev_returns, seed=7)
     s_agent, s_base, _ = walk_forward(synth, "SYNTH")
     ms = metrics(s_agent)["sharpe"]; mb = metrics(s_base["rparity"])["sharpe"]
-    print(f"Sharpe do agente em dados SINTETICOS: {ms:.2f} (risk parity: {mb:.2f})")
-    print("  " + ("OK: agente nao fabrica sinal do ruido." if ms < 0.5
-                  else "ALERTA: agente 'ganha' em ruido puro -> resultado real e suspeito."))
+    print(f"Agent Sharpe on SYNTHETIC data: {ms:.2f} (risk parity: {mb:.2f})")
+    print("  " + ("OK: the agent does not create signal out of noise." if ms < 0.5
+                  else "WARNING: the agent 'wins' on pure noise -> the real result is suspicious."))
 
-    # ---- Analise por regime ----
-    print("\n=== ROBUSTEZ: DESEMPENHO POR REGIME ===")
-    # alinhar regime ao comprimento do agente OOS (aproximacao simples)
+    # ---- Regime analysis ----
+    print("\n=== ROBUSTNESS: PERFORMANCE BY REGIME ===")
+    # align the regime to the length of the agent's OOS series (simple approximation)
     hv = regime_split(dev_returns)[-len(agent_oos):]
     hi = metrics(agent_oos[hv]); lo = metrics(agent_oos[~hv])
-    print(f"  Alta vol:  Sharpe={hi['sharpe']:.2f}  MaxDD={hi['mdd']:.1f}%")
-    print(f"  Baixa vol: Sharpe={lo['sharpe']:.2f}  MaxDD={lo['mdd']:.1f}%")
-    print("  (esperado num gestor de risco real: vantagem relativa MAIOR em alta vol)")
+    print(f"  High vol: Sharpe={hi['sharpe']:.2f}  MaxDD={hi['mdd']:.1f}%")
+    print(f"  Low vol:  Sharpe={lo['sharpe']:.2f}  MaxDD={lo['mdd']:.1f}%")
+    print("  (expected from a real risk manager: bigger relative advantage in high vol)")
 
-    # ---- HELD-OUT SAGRADO: uma unica passagem, no fim ----
-    print("\n=== HELD-OUT SAGRADO (uma unica avaliacao) ===")
+    # ---- SACRED HELD-OUT: a single pass, at the end ----
+    print("\n=== SACRED HELD-OUT (single evaluation) ===")
     heldout_returns = to_returns(heldout_prices)
-    # treina em TODO o dev, avalia no held-out (media de seeds)
+    # train on ALL of dev, evaluate on the held-out set (average of seeds)
     ho_rets = []
     for s in range(N_SEEDS):
         model = train_agent(dev_returns, seed=99000 + s)
@@ -476,33 +495,36 @@ def main():
         ho_rets.append(rets)
     L = min(len(x) for x in ho_rets)
     ho_agent = np.mean([x[:L] for x in ho_rets], axis=0)
-    print(f"{'Estrategia':<16}{'Sharpe':>8}{'Anual%':>8}{'MaxDD%':>8}")
+    print(f"{'Strategy':<16}{'Sharpe':>8}{'Annual%':>9}{'MaxDD%':>8}")
     for name, series in [("RL Agent", ho_agent),
                          ("Equal-Weight", bh_equal_weight(heldout_returns)[-L:]),
                          ("Risk Parity", risk_parity(heldout_returns)[-L:]),
                          ("Mean-Variance", mean_variance(dev_returns, heldout_returns)[-L:])]:
         m = metrics(series)
-        print(f"{name:<16}{m['sharpe']:>8.2f}{m['annual']:>8.1f}{m['mdd']:>8.1f}")
+        print(f"{name:<16}{m['sharpe']:>8.2f}{m['annual']:>9.1f}{m['mdd']:>8.1f}")
 
-    # ---- Visualizacao ----
+    # ---- Charts ----
     fig, ax = plt.subplots(1, 2, figsize=(15, 5))
     ax[0].plot(nav_from_returns(agent_oos), label="RL Agent", lw=2)
     ax[0].plot(nav_from_returns(base_oos["rparity"]), label="Risk Parity", alpha=.8)
     ax[0].plot(nav_from_returns(base_oos["equal"]), label="Equal-Weight", alpha=.8)
-    ax[0].set_title("Walk-forward OOS — NAV"); ax[0].legend(); ax[0].grid(alpha=.3)
+    ax[0].set_title("Walk-forward OOS - NAV"); ax[0].legend(); ax[0].grid(alpha=.3)
     ax[1].plot(nav_from_returns(ho_agent), label="RL Agent", lw=2)
     ax[1].plot(nav_from_returns(risk_parity(heldout_returns)[-L:]), label="Risk Parity", alpha=.8)
-    ax[1].set_title("HELD-OUT sagrado — NAV"); ax[1].legend(); ax[1].grid(alpha=.3)
+    ax[1].set_title("SACRED HELD-OUT - NAV"); ax[1].legend(); ax[1].grid(alpha=.3)
     plt.tight_layout()
-    plt.savefig("resultados.png", dpi=120, bbox_inches="tight")
-    print("\n[grafico guardado em resultados.png]")
+    plt.savefig("results.png", dpi=120, bbox_inches="tight")
+    print("\n[chart saved as results.png]")
 
     print("\n" + "="*70)
-    print("VEREDICTO HONESTO: o resultado mais valioso pode ser 'nao bate risk parity")
-    print("de forma significativa' — e reporta-lo com DSR + dados sinteticos + held-out")
-    print("prova que sabes onde estao os corpos enterrados. Isso e a peca de portfolio.")
+    print("HONEST VERDICT: the most valuable result may be 'does not beat risk parity")
+    print("significantly'. Reporting it with the DSR + synthetic data + held-out test")
+    print("shows the evaluation was done carefully, which matters more than the number.")
     print("="*70)
 
 
 if __name__ == "__main__":
     main()
+
+
+
