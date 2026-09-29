@@ -1,62 +1,45 @@
-# Portfolio RL — Alocação de carteira à prova de auto-ilusão
+# Portfolio allocation with reinforcement learning (PPO)
 
-Agente de aprendizagem por reforço (PPO) para alocação de carteira de ETFs, construído com um objetivo invulgar: **não me deixar enganar a mim próprio**. Num domínio de baixo sinal e ruído elevado como os mercados financeiros, a parte difícil não é treinar um modelo que pareça bom no histórico — é provar que esse desempenho é real e não um artefacto de sobreajuste ou de testar muitas configurações até uma "funcionar" por sorte.
+I trained a PPO agent to allocate between 6 ETFs (SPY, QQQ, IWM, EFA, EEM, AGG)
+and compared it with simple strategies. Most of the work went into validation,
+so I could tell if the agent actually learned something.
 
-Este projeto leva essa questão a sério. A maior parte do esforço não está no agente (que é deliberadamente simples), mas na **infraestrutura de validação** desenhada para detetar e refutar falsos positivos.
+It didn't beat them. Out-of-sample it basically matched equal-weight.
 
-## Resultado
+| Strategy      | Sharpe | Annual return | Max drawdown |
+|---------------|--------|---------------|--------------|
+| RL Agent      | 0.63   | 8.7%          | -29.4%       |
+| Equal-Weight  | 0.65   | 8.8%          | -28.0%       |
+| 60/40         | 0.88   | 9.0%          | -21.3%       |
+| Risk Parity   | 0.66   | 6.2%          | -22.9%       |
+| Mean-Variance | 0.93   | 11.2%         | -28.0%       |
 
-Após validação rigorosa, o agente **não supera, de forma estatisticamente significativa, baselines clássicos** como risk parity ou equal-weight:
+Walk-forward, 16 windows, 2013 to 2025.
 
-```
-Estrategia       Sharpe   Anual%   MaxDD%
------------------------------------------
-RL Agent          0.54     7.4     -33.0
-Equal-Weight      0.52     6.9     -30.0
-60/40             0.74     7.6     -22.9
-Risk Parity       0.61     6.3     -24.0
-Mean-Variance     0.67    10.5     -31.6
-```
+<img width="1490" height="490" alt="download" src="https://github.com/user-attachments/assets/fe7df863-6751-4297-a539-202f1dc5a179" />
 
-**Deflated Sharpe Ratio = 0.000** (contra 45 configuracoes/seeds testadas). O Sharpe do agente esta dentro do que se esperaria so por sorte, dado o numero de tentativas. No held-out sagrado (~18 meses nunca tocados durante o desenvolvimento), o agente empata com equal-weight (Sharpe 1.05 vs 1.06).
 
-Este resultado negativo é o ponto central do projeto, não uma deceção. **Reportá-lo honestamente — com as ferramentas que provam que é robusto — é a competência que o projeto demonstra.** Num contexto real de gestão de ativos, saber quando *não* há edge é tão valioso como encontrá-lo, e muito mais raro.
+The 3 seeds gave almost the same Sharpe (0.62, 0.63, 0.63), so the agent most
+likely ended up close to equal weights. On the held-out period (last 18 months,
+used once) it was the same: 1.37 vs 1.38.
 
-## A metodologia anti-auto-ilusão
+## Validation
 
-O que distingue este projeto é o conjunto de salvaguardas contra falsos positivos:
+- Walk-forward (3 years train, 9 months test) plus a held-out period
+- 3 seeds per window
+- Same rules for agent and baselines: transaction costs, weights drifting with prices
+- Block bootstrap vs the baselines: -0.02 Sharpe vs equal-weight (worse in 95%
+  of samples), -0.03 vs risk parity (no real difference)
+- Synthetic test with the days shuffled: agent 0.04 vs 0.11 for the best
+  baseline, so it doesn't find signal in noise
 
-**Agente deliberadamente modesto.** PPO com uma MLP pequena (64x64), poucas features, poucos timesteps. Em domínios de baixo sinal, um agente mais expressivo não extrai mais sinal — apenas memoriza melhor o percurso histórico. A simplicidade *é* a regularização que mais importa.
+The deflated Sharpe says "significant", but only because the seeds were so
+similar that the luck benchmark ended up near zero. It just means the Sharpe is
+above zero, which any long-only portfolio got in this period.
 
-**Reward de gestão de risco, não de previsão.** Em vez de pedir ao agente que adivinhe a direção dos retornos (já demonstrado, noutro projeto, ser imprevisível), a reward usa o **Differential Sharpe Ratio** (Moody & Saffell, 1998) — uma forma online e estável do Sharpe — mais uma penalização de drawdown. Pede ao agente que *module a exposição ao risco*, que é o único sinal genuíno disponível (clustering de volatilidade).
+## Limitations
 
-**Validação de três níveis com purging e embargo.** Walk-forward com janelas deslizantes para medir generalização, um **gap temporal (embargo)** entre treino e teste para matar a autocorrelação das janelas sobrepostas (López de Prado), e um **bloco held-out sagrado** que não existe durante o desenvolvimento e é avaliado uma única vez no fim.
+The ETFs were picked with hindsight, only 3 seeds and one set of
+hyperparameters, and 2010 to 2026 was a very good period for US stocks and bonds.
 
-**Deflated Sharpe Ratio.** Múltiplas seeds (o RL é estocástico; um número único mente) e correção do Sharpe pelo número de tentativas. O multiple-testing — quantas vezes o nosso próprio cérebro tocou nos dados — é o verdadeiro assassino da significância, e o DSR mede-o.
 
-**Teste de dados sintéticos (o juiz supremo).** Reamostragem que preserva as distribuições marginais e correlações entre ativos mas **destrói a estrutura temporal**. Por construção, não há nada para o agente aprender. Se ele "ganhasse" aqui, provaria que o pipeline fabrica sinal a partir de ruído — e o resultado real seria falso. (O agente obteve Sharpe 0.44 no sintético, igual ao baseline: o pipeline **não** fabrica sinal.)
-
-**Análise por regime.** O edge de um gestor de risco deve aparecer onde a teoria diz (alta volatilidade), não espalhado ao acaso. *Onde* o desempenho aparece é, ele próprio, evidência sobre se é real.
-
-## Nota de honestidade
-
-Os ETFs do universo foram escolhidos ex-post, o que introduz survivorship/selection bias. Sem uma base de dados de ETFs delistados, este viés fica *nomeado* mas não totalmente eliminado. Em produção, o universo seria definido com a informação disponível no início de cada janela.
-
-## Stack
-
-Python, Stable-Baselines3 (PPO), Gymnasium, yfinance, NumPy/SciPy, pandas.
-
-## Como correr
-
-```bash
-pip install -r requirements.txt
-python portfolio_rl.py
-```
-
-Parâmetros modestos por opção de desenho (ver a filosofia no topo do script). Demora ~5-12 min em CPU.
-
----
-*Projeto de investigação. Não constitui aconselhamento financeiro.*
-
----
-*Projeto de investigação. Não constitui aconselhamento financeiro.*
